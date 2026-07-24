@@ -40,6 +40,7 @@ where
     let mut output_dir: Option<PathBuf> = None;
     let mut mode = InputMode::Mmap;
     let mut include_overlap = false;
+    let mut include_revcomp = false;
     let mut circular = false;
     let mut target_base = QuartetBase::G;
 
@@ -134,6 +135,9 @@ where
             "--overlap" => {
                 include_overlap = true;
             }
+            "--revcomp" => {
+                include_revcomp = true;
+            }
             "--circular" => {
                 circular = true;
             }
@@ -176,7 +180,14 @@ where
             if output_dir.is_some() {
                 return Err(usage("--output-dir can only be used with --file"));
             }
-            process_inline_sequence(seq, format, output_path, scan, include_overlap)?;
+            process_inline_sequence(
+                seq,
+                format,
+                output_path,
+                scan,
+                include_overlap,
+                include_revcomp,
+            )?;
         }
         InputSpec::File(path) => {
             if output_path.is_some() {
@@ -184,7 +195,15 @@ where
                     "--output is only valid with --sequence; use --output-dir for --file",
                 ));
             }
-            process_fasta_file(path, mode, format, scan, output_dir, include_overlap)?;
+            process_fasta_file(
+                path,
+                mode,
+                format,
+                scan,
+                output_dir,
+                include_overlap,
+                include_revcomp,
+            )?;
         }
     }
     Ok(())
@@ -217,6 +236,9 @@ fn usage(reason: &str) -> String {
     msg.push_str("  --mode <mmap|stream> Input mode when using --file (default mmap)\n");
     msg.push_str(
         "  --overlap            Emit raw hits (.overlap.<format>) and family ranges (.family.<format>)\n",
+    );
+    msg.push_str(
+        "  --revcomp            Also scan the reverse-complement strand into .revcomp.<format>\n",
     );
     msg.push_str("  --circular           Treat each sequence/chromosome as circular\n");
     msg.push_str("  --help               Show this message\n");
@@ -300,12 +322,20 @@ fn process_inline_sequence(
     output_path: Option<PathBuf>,
     scan: ScanConfig,
     include_overlap: bool,
+    include_revcomp: bool,
 ) -> Result<(), String> {
     let mut normalized = sequence.into_bytes();
     normalized.make_ascii_lowercase();
     let sequence_len = normalized.len();
     if include_overlap && output_path.is_none() {
         return Err(usage("--overlap requires --output when using --sequence"));
+    }
+    let revcomp_output_is_missing =
+        output_path.as_deref().is_none() || output_path.as_deref() == Some(Path::new("-"));
+    if include_revcomp && revcomp_output_is_missing {
+        return Err(usage(
+            "--revcomp requires a file path via --output when using --sequence",
+        ));
     }
 
     let (results, family_ranges, raw_hits) = run_scan_for_export(
@@ -314,6 +344,16 @@ fn process_inline_sequence(
         include_overlap,
         sequence_len,
     );
+    let revcomp_results = if include_revcomp {
+        Some(run_revcomp_scan_for_export(
+            &normalized,
+            "inline sequence",
+            scan,
+            include_overlap,
+        )?)
+    } else {
+        None
+    };
     write_primary_output(
         output_path.as_deref(),
         format,
@@ -335,6 +375,20 @@ fn process_inline_sequence(
             sequence_len,
         )?;
     }
+    if let Some((hits, ranges, raw_hits)) = revcomp_results {
+        let base = output_path
+            .as_ref()
+            .expect("revcomp output requires an explicit --output path");
+        write_revcomp_exports(
+            base,
+            format,
+            &hits,
+            &ranges,
+            raw_hits.as_deref(),
+            scan.topology(),
+            sequence_len,
+        )?;
+    }
 
     Ok(())
 }
@@ -346,6 +400,7 @@ fn process_fasta_file(
     scan: ScanConfig,
     output_dir: Option<PathBuf>,
     include_overlap: bool,
+    include_revcomp: bool,
 ) -> Result<(), String> {
     let dir = output_dir.ok_or_else(|| usage("--output-dir is required when --file is used"))?;
     fs::create_dir_all(&dir).map_err(|err| format!("failed to create {dir:?}: {err}"))?;
@@ -369,10 +424,20 @@ fn process_fasta_file(
             }
             chrom_outputs.into_par_iter().try_for_each(
                 |(chrom, filepath)| -> Result<(), String> {
-                    let (_name, sequence) = chrom.into_parts();
+                    let (name, sequence) = chrom.into_parts();
                     let sequence_len = sequence.len();
                     let (results, family_ranges, raw_hits) =
                         run_scan_for_export(sequence.clone(), scan, include_overlap, sequence_len);
+                    let revcomp_results = if include_revcomp {
+                        Some(run_revcomp_scan_for_export(
+                            sequence.as_slice(),
+                            &name,
+                            scan,
+                            include_overlap,
+                        )?)
+                    } else {
+                        None
+                    };
                     write_results_to_path(
                         &filepath,
                         format,
@@ -393,13 +458,120 @@ fn process_fasta_file(
                             sequence_len,
                         )?;
                     }
+                    if let Some((hits, ranges, raw_hits)) = revcomp_results {
+                        write_revcomp_exports(
+                            &filepath,
+                            format,
+                            &hits,
+                            &ranges,
+                            raw_hits.as_deref(),
+                            scan.topology(),
+                            sequence_len,
+                        )?;
+                    }
                     Ok(())
                 },
             )?;
         }
         InputMode::Stream => {
             let mut processed = 0usize;
-            if include_overlap {
+            if include_revcomp && include_overlap {
+                qgrs::stream::process_fasta_stream_bidirectional_with_limits_overlap_topology_and_len_with_base(
+                    &path,
+                    scan.min_tetrads(),
+                    scan.min_score(),
+                    scan.limits(),
+                    scan.topology(),
+                    scan.target_base(),
+                    |name, mut forward, mut reverse_rc, sequence_len| {
+                        processed += 1;
+                        let filename = next_output_filename(
+                            &name,
+                            format,
+                            scan.target_base(),
+                            &mut name_counts,
+                        );
+                        let filepath = dir.join(&filename);
+                        write_results_to_path(
+                            &filepath,
+                            format,
+                            &forward.hits,
+                            scan.topology(),
+                            sequence_len,
+                        )
+                        .map_err(io::Error::other)?;
+                        let forward_raw_hits = forward
+                            .raw_hits
+                            .take()
+                            .expect("raw hits missing from forward bidirectional stream results");
+                        write_overlap_exports(
+                            &filepath,
+                            format,
+                            &forward_raw_hits,
+                            &forward.family_ranges,
+                            scan.topology(),
+                            sequence_len,
+                        )
+                        .map_err(io::Error::other)?;
+
+                        let reverse_raw_hits = reverse_rc
+                            .raw_hits
+                            .take()
+                            .expect("raw hits missing from reverse bidirectional stream results");
+                        write_revcomp_exports(
+                            &filepath,
+                            format,
+                            &reverse_rc.hits,
+                            &reverse_rc.family_ranges,
+                            Some(&reverse_raw_hits),
+                            scan.topology(),
+                            sequence_len,
+                        )
+                        .map_err(io::Error::other)?;
+                        Ok(())
+                    },
+                )
+                .map_err(|err| format!("failed to process {path:?}: {err}"))?;
+            } else if include_revcomp {
+                qgrs::stream::process_fasta_stream_bidirectional_with_limits_topology_and_len_with_base(
+                    &path,
+                    scan.min_tetrads(),
+                    scan.min_score(),
+                    scan.limits(),
+                    scan.topology(),
+                    scan.target_base(),
+                    |name, forward_hits, reverse_hits_rc, sequence_len| {
+                        processed += 1;
+                        let filename = next_output_filename(
+                            &name,
+                            format,
+                            scan.target_base(),
+                            &mut name_counts,
+                        );
+                        let filepath = dir.join(&filename);
+                        write_results_to_path(
+                            &filepath,
+                            format,
+                            &forward_hits,
+                            scan.topology(),
+                            sequence_len,
+                        )
+                        .map_err(io::Error::other)?;
+                        write_revcomp_exports(
+                            &filepath,
+                            format,
+                            &reverse_hits_rc,
+                            &[],
+                            None,
+                            scan.topology(),
+                            sequence_len,
+                        )
+                        .map_err(io::Error::other)?;
+                        Ok(())
+                    },
+                )
+                .map_err(|err| format!("failed to process {path:?}: {err}"))?;
+            } else if include_overlap {
                 qgrs::stream::process_fasta_stream_with_limits_overlap_topology_and_len_with_base(
                     &path,
                     scan.min_tetrads(),
@@ -566,6 +738,113 @@ fn run_scan_for_export(
     consolidate_for_export(raw, capture_raw, scan.topology(), sequence_len)
 }
 
+fn run_revcomp_scan_for_export(
+    forward_sequence: &[u8],
+    sequence_name: &str,
+    scan: ScanConfig,
+    capture_raw: bool,
+) -> Result<ConsolidatedResults, String> {
+    let sequence_len = forward_sequence.len();
+    let revcomp = reverse_complement_lowercase(forward_sequence, sequence_name)?;
+    Ok(run_scan_for_export(
+        Arc::new(revcomp),
+        scan,
+        capture_raw,
+        sequence_len,
+    ))
+}
+
+fn reverse_complement_lowercase(sequence: &[u8], sequence_name: &str) -> Result<Vec<u8>, String> {
+    let mut revcomp = Vec::with_capacity(sequence.len());
+    for (reverse_index, byte) in sequence.iter().rev().copied().enumerate() {
+        let original_position = sequence.len() - reverse_index;
+        revcomp.push(complement_iupac_lowercase(
+            byte,
+            sequence_name,
+            original_position,
+        )?);
+    }
+    Ok(revcomp)
+}
+
+fn complement_iupac_lowercase(
+    byte: u8,
+    sequence_name: &str,
+    original_position: usize,
+) -> Result<u8, String> {
+    let complement = match byte.to_ascii_lowercase() {
+        b'a' => b't',
+        b't' | b'u' => b'a',
+        b'c' => b'g',
+        b'g' => b'c',
+        b'r' => b'y',
+        b'y' => b'r',
+        b'k' => b'm',
+        b'm' => b'k',
+        b'b' => b'v',
+        b'v' => b'b',
+        b'd' => b'h',
+        b'h' => b'd',
+        b's' => b's',
+        b'w' => b'w',
+        b'n' => b'n',
+        _ => {
+            return Err(format!(
+                "invalid nucleotide byte 0x{byte:02X} ('{}') in {sequence_name} at 1-based position {original_position}",
+                char::from(byte).escape_default()
+            ));
+        }
+    };
+    Ok(complement)
+}
+
+fn project_revcomp_hits_to_forward(
+    hits: &[G4],
+    topology: SequenceTopology,
+    sequence_len: usize,
+) -> Vec<G4> {
+    let mut projected = hits.to_vec();
+    for hit in &mut projected {
+        let (start, end) = map_revcomp_interval(hit.start, hit.end, topology, sequence_len);
+        hit.start = start;
+        hit.end = end;
+    }
+    projected.sort_by(|left, right| (left.start, left.end).cmp(&(right.start, right.end)));
+    projected
+}
+
+fn project_revcomp_ranges_to_forward(
+    ranges: &[(usize, usize)],
+    topology: SequenceTopology,
+    sequence_len: usize,
+) -> Vec<(usize, usize)> {
+    let mut projected = ranges
+        .iter()
+        .map(|(start, end)| map_revcomp_interval(*start, *end, topology, sequence_len))
+        .collect::<Vec<_>>();
+    projected.sort_unstable();
+    projected
+}
+
+fn map_revcomp_interval(
+    start_rc: usize,
+    end_rc: usize,
+    topology: SequenceTopology,
+    sequence_len: usize,
+) -> (usize, usize) {
+    if sequence_len == 0 {
+        return (start_rc, end_rc);
+    }
+    let end_anchor = if topology.is_circular() {
+        ((end_rc - 1) % sequence_len) + 1
+    } else {
+        end_rc
+    };
+    let start = sequence_len - end_anchor + 1;
+    let end = start + (end_rc - start_rc);
+    (start, end)
+}
+
 fn write_primary_output(
     output_path: Option<&Path>,
     format: OutputFormat,
@@ -646,6 +925,44 @@ fn write_overlap_exports(
         }
     }
     Ok(())
+}
+
+fn write_revcomp_exports(
+    primary_path: &Path,
+    format: OutputFormat,
+    hits: &[G4],
+    family_ranges: &[(usize, usize)],
+    raw_hits: Option<&[G4]>,
+    topology: SequenceTopology,
+    sequence_len: usize,
+) -> Result<(), String> {
+    let revcomp_path = revcomp_output_path(primary_path, format);
+    let projected_hits = project_revcomp_hits_to_forward(hits, topology, sequence_len);
+    write_results_to_path(
+        &revcomp_path,
+        format,
+        &projected_hits,
+        topology,
+        sequence_len,
+    )?;
+    if let Some(raw_hits) = raw_hits {
+        let projected_raw_hits = project_revcomp_hits_to_forward(raw_hits, topology, sequence_len);
+        let projected_ranges =
+            project_revcomp_ranges_to_forward(family_ranges, topology, sequence_len);
+        write_overlap_exports(
+            &revcomp_path,
+            format,
+            &projected_raw_hits,
+            &projected_ranges,
+            topology,
+            sequence_len,
+        )?;
+    }
+    Ok(())
+}
+
+fn revcomp_output_path(base: &Path, format: OutputFormat) -> PathBuf {
+    append_output_suffix(base, ".revcomp", format)
 }
 
 fn overlap_path(base: &Path, format: OutputFormat) -> PathBuf {

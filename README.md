@@ -18,6 +18,7 @@ QGRS-Rust is a ground-up Rust rewrite of the [freezer333/qgrs-cpp](https://githu
   - [CLI reference](#cli-reference)
   - [How `--max-g4-length` works](#how---max-g4-length-works)
   - [Output schema](#output-schema)
+  - [Reverse-complement exports](#reverse-complement-exports---revcomp)
 - [🚢 Release notes](#-release-notes)
 - [✅ Testing & QA](#-testing--qa)
 - [📊 Benchmarking tips](#-benchmarking-tips)
@@ -27,6 +28,7 @@ QGRS-Rust is a ground-up Rust rewrite of the [freezer333/qgrs-cpp](https://githu
 - Rust scanner mirrors the legacy scoring heuristics while benefiting from zero-copy iterators and Rayon parallelism.
 - Memory-mapped (`mmap`) and streaming (`stream`) readers let you pick the best strategy per dataset.
 - Optional `--base g|c` selects G4 (`g`) or i-motif (`c`) tetrad runs on the original input sequence.
+- Optional `--revcomp` scans the selected motif class on the reverse-complement strand and writes separate `.revcomp.<format>` outputs.
 - Optional `--circular` topology support treats each sequence/chromosome as a ring for wrap-around motif detection.
 - CSV/Parquet exporters always report 1-based, inclusive coordinates for genome-browser compatibility.
 - CLI validation enforces sane tetrad, loop, and window settings to avoid silent misconfiguration.
@@ -35,12 +37,12 @@ QGRS-Rust is a ground-up Rust rewrite of the [freezer333/qgrs-cpp](https://githu
 
 ## 🚢 Release notes
 
-This release is a breaking CLI and output-schema update focused on replacing reverse-complement scanning with direct base-selectable motif scanning. See [`RELEASE.md`](RELEASE.md) for the full release text.
+The current CLI supports direct base-selectable scans and optional reverse-complement output. See [`RELEASE.md`](RELEASE.md) for the version history.
 
 Highlights:
 
-- `--revcomp` has been removed; i-motif-like scans now use `--base c` directly on the original input sequence.
 - `--base g|c` selects the target tetrad base. The default remains `--base g` for G4 scans.
+- `--revcomp` adds a true reverse-complement scan without changing the existing forward output or schema.
 - `--max-g-run` has been replaced by `--max-run`.
 - CSV and Parquet output use `score` instead of `gscore`.
 - FASTA output files are motif-labeled: `{seqid}.g4.*` or `{seqid}.i-motif.*`.
@@ -87,7 +89,7 @@ target/release/qgrs --help
 
 ## 🧪 Usage
 
-`qgrs` accepts either an inline sequence (`--sequence`) or an input file (`--file`). FASTA inputs (plain text or gzip-compressed `.gz`) are split per chromosome header, and each slice is processed independently. If you provide a file, choose either the memory-mapped (`mmap`) or buffered streaming (`stream`) pipeline with `--mode`. Pass `--base c` to scan i-motif C tetrads instead of the default G4 G tetrads. Pass `--circular` when the sequence/chromosome should be scanned as a circular molecule (wrap-around hits allowed). All examples below assume you already built the release binary (`target/release/qgrs`) or installed it as `qgrs`; use `cargo run --release --bin qgrs -- …` only when iterating locally. The banner below comes straight from `src/bin/qgrs.rs` so it always matches the binary.
+`qgrs` accepts either an inline sequence (`--sequence`) or an input file (`--file`). FASTA inputs (plain text or gzip-compressed `.gz`) are split per chromosome header, and each slice is processed independently. If you provide a file, choose either the memory-mapped (`mmap`) or buffered streaming (`stream`) pipeline with `--mode`. Pass `--base c` to scan i-motif C tetrads instead of the default G4 G tetrads. Pass `--revcomp` to retain the normal forward output and add a separate scan of the selected motif class on the reverse-complement strand. Pass `--circular` when the sequence/chromosome should be scanned as a circular molecule (wrap-around hits allowed). All examples below assume you already built the release binary (`target/release/qgrs`) or installed it as `qgrs`; use `cargo run --release --bin qgrs -- …` only when iterating locally. The banner below comes straight from `src/bin/qgrs.rs` so it always matches the binary.
 
 ```
 Usage: qgrs -- [--sequence <SEQ> | --file <PATH>] [options]
@@ -104,6 +106,7 @@ Options:
    --output-dir <DIR>     Directory for per-chromosome exports when using --file
    --mode <mmap|stream>   Input mode when using --file (default mmap)
    --overlap              Also emit raw hits and family ranges beside each primary output
+   --revcomp              Also scan reverse-complement and emit .revcomp.<format>
    --circular             Treat each sequence/chromosome as circular
    --help                 Show this message
 ```
@@ -164,6 +167,15 @@ target/release/qgrs \
    --format parquet \
    --base c \
    --overlap
+
+# 8. Emit forward and reverse-strand G4 results
+target/release/qgrs \
+   --file data/genome.fa \
+   --mode stream \
+   --output-dir ./qgrs_both_strands \
+   --format parquet \
+   --revcomp \
+   --overlap
 ```
 
 ### CLI reference
@@ -182,9 +194,10 @@ target/release/qgrs \
 | `--output <FILE\|- >`     | Single output file (or `-` for stdout) when scanning inline sequences.                     | stdout for CSV           |
 | `--output-dir <DIR>`      | Directory for per-chromosome files when reading FASTA/plain inputs. File names are `{seqid}.g4.<format>` or `{seqid}.i-motif.<format>`. | _required with `--file`_ |
 | `--overlap`               | Emit `{seqid}.{motif}.overlap.<format>` (raw hits) and `{seqid}.{motif}.family.<format>` (family ranges) per FASTA output file. | off                      |
+| `--revcomp`               | Also scan the reverse-complement strand and emit `{seqid}.{motif}.revcomp.<format>`. | off                      |
 | `--circular`              | Treat each sequence/chromosome as circular; wrap-around hits keep expanded coordinates in output, so `end` may exceed chromosome length `N`. | off                      |
 
-The CLI aborts with a descriptive error if incompatible parameters are provided (e.g., `--mode stream` without `--file`, `--base a`, or `--max-run < min-tetrads`). When scanning files you must pass `--output-dir`; when `--overlap` is enabled for inline scans, `--output` is required so sidecar files can be named deterministically.
+The CLI aborts with a descriptive error if incompatible parameters are provided (e.g., `--mode stream` without `--file`, `--base a`, or `--max-run < min-tetrads`). When scanning files you must pass `--output-dir`; when `--overlap` is enabled for inline scans, `--output` is required so sidecar files can be named deterministically. Inline `--revcomp` also requires a real output path and cannot write its two result streams to stdout.
 
 ### How `--max-g4-length` works
 
@@ -219,6 +232,18 @@ Both exporters emit the same fields (see `render_csv` and `write_parquet_from_re
 | `sequence`       | Exact motif sequence extracted from the input.                                         |
 
 CSV output always includes the header `start,end,length,tetrads,y1,y2,y3,score,sequence`. When scanning FASTA inputs, each chromosome is written to its own motif-labeled file such as `chr1.g4.csv` or `chr1.i-motif.csv` (so the filename, not a column, captures the chromosome name and motif class). Parquet exports contain the same columns using Arrow types (`UInt64` for coordinates/lengths, `Int32` for loop lengths and score, and UTF-8 for sequences). In circular mode, CLI exports keep the same expanded-coordinate representation used internally, so wrap-around motifs can appear with `end > N`.
+
+### Reverse-complement exports (`--revcomp`)
+
+`--revcomp` leaves every forward output unchanged and adds `{base}.revcomp.<format>`. The reverse output uses the same schema, thresholds, selected `--base`, topology, and consolidation logic as the forward scan.
+
+- `start` and `end` are mapped back to 1-based coordinates on the original input. Linear hits use `start = N - end_rc + 1` and `end = N - start_rc + 1`.
+- Circular hits keep expanded coordinates after mapping, so a cross-origin reverse hit can also report `end > N`.
+- `sequence` remains in reverse-complement scan direction (negative-strand 5′→3′).
+- With `--overlap`, the reverse scan also writes `{base}.revcomp.overlap.<format>` and `{base}.revcomp.family.<format>`.
+- `--base g --revcomp` reports negative-strand G4 candidates; `--base c --revcomp` reports negative-strand i-motif candidates.
+
+In stream mode, each normalized chromosome is spooled to an automatically deleted temporary file and read backward in bounded blocks for the reverse scan. RAM remains bounded, while temporary disk usage peaks at approximately the size of the largest chromosome. Set the standard `TMPDIR` environment variable when those files must reside on a specific volume.
 
 ### Overlap exports (`--overlap`)
 

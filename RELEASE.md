@@ -1,5 +1,12 @@
 # Release Notes
 
+## v1.8.0 - Reverse-complement strand exports
+
+- Restored optional `--revcomp` scans for both `--base g` and `--base c` without changing the forward CSV/Parquet schema.
+- Reverse hits, raw overlap hits, and family ranges are written to separate `.revcomp.*` files with coordinates mapped back to the original input and motif sequence retained in negative-strand 5′→3′ direction.
+- Streaming scans spool only the current chromosome to an automatically removed temporary file, then read it backward in bounded blocks so reverse-complement output does not require chromosome-sized RAM.
+- Reverse-complement validation supports ASCII IUPAC DNA symbols plus `U` and reports unsupported bytes with chromosome and 1-based input position.
+
 ## v1.7.0 - Bounded target-base run expansion
 
 This release fixes a memory blow-up in target-base scans on pathological contigs that contain very long uninterrupted G or C runs.
