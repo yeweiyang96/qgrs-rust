@@ -809,7 +809,7 @@ fn project_revcomp_hits_to_forward(
         hit.start = start;
         hit.end = end;
     }
-    projected.sort_by(|left, right| (left.start, left.end).cmp(&(right.start, right.end)));
+    projected.sort_by_key(|hit| (hit.start, hit.end));
     projected
 }
 
